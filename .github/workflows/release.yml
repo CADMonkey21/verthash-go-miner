@@ -7,13 +7,39 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install pinned CUDA 12.6.2 compiler (V12.6.77 / CL-34841621)
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-6=12.6.77-1 \
+            cuda-nvvm-12-6=12.6.77-1 \
+            cuda-crt-12-6=12.6.77-1 \
+            cuda-cudart-dev-12-6=12.6.77-1 \
+            cuda-cudart-12-6=12.6.77-1 \
+            cuda-cccl-12-6=12.6.77-1 \
+            cuda-driver-dev-12-6=12.6.77-1 \
+            cuda-toolkit-12-6-config-common=12.6.77-1 \
+            cuda-toolkit-12-config-common=12.6.77-1 \
+            cuda-toolkit-config-common=12.6.77-1
+          echo "/usr/local/cuda-12.6/bin" >> $GITHUB_PATH
+
+      - name: Verify pkg/cuda/verthash.ptx matches pkg/cuda/verthash.cu
+        run: |
+          nvcc --version
+          nvcc -ptx -O3 -arch=sm_75 pkg/cuda/verthash.cu -o pkg/cuda/verthash.ptx
+          git diff --ignore-cr-at-eol --exit-code pkg/cuda/verthash.ptx
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -31,6 +57,14 @@ jobs:
       - name: Generate SHA256 Checksums
         run: |
           sha256sum verthash-miner-windows-amd64.exe verthash-miner-linux-amd64 > SHA256SUMS.txt
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            verthash-miner-windows-amd64.exe
+            verthash-miner-linux-amd64
+            SHA256SUMS.txt
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

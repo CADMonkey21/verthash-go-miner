@@ -1,0 +1,52 @@
+name: CI & PTX Reproducibility Check
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned CUDA 12.6.2 compiler (V12.6.77 / CL-34841621)
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-6=12.6.77-1 \
+            cuda-nvvm-12-6=12.6.77-1 \
+            cuda-crt-12-6=12.6.77-1 \
+            cuda-cudart-dev-12-6=12.6.77-1 \
+            cuda-cudart-12-6=12.6.77-1 \
+            cuda-cccl-12-6=12.6.77-1 \
+            cuda-driver-dev-12-6=12.6.77-1 \
+            cuda-toolkit-12-6-config-common=12.6.77-1 \
+            cuda-toolkit-12-config-common=12.6.77-1 \
+            cuda-toolkit-config-common=12.6.77-1
+          echo "/usr/local/cuda-12.6/bin" >> $GITHUB_PATH
+
+      - name: Regenerate pkg/cuda/verthash.ptx and verify zero diff
+        run: |
+          nvcc --version
+          nvcc -ptx -O3 -arch=sm_75 pkg/cuda/verthash.cu -o pkg/cuda/verthash.ptx
+          git diff --ignore-cr-at-eol --exit-code pkg/cuda/verthash.ptx
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build & Vet (Linux & Windows)
+        run: |
+          go vet ./...
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o verthash-miner-linux-amd64 ./cmd/verthash-miner
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o verthash-miner-windows-amd64.exe ./cmd/verthash-miner
