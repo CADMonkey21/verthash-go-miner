@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,12 +40,33 @@ func resolveVerthashDat(customPath string) string {
 	return "verthash.dat"
 }
 
+func filterDevices(all []cuda.DeviceInfo, filterStr string) []cuda.DeviceInfo {
+	filterStr = strings.TrimSpace(filterStr)
+	if filterStr == "" {
+		return all
+	}
+	allowed := make(map[int32]bool)
+	for _, part := range strings.Split(filterStr, ",") {
+		if idx, err := strconv.Atoi(strings.TrimSpace(part)); err == nil {
+			allowed[int32(idx)] = true
+		}
+	}
+	var out []cuda.DeviceInfo
+	for _, d := range all {
+		if allowed[d.Index] {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
 type gpuWorkerHandle struct {
 	info       cuda.DeviceInfo
 	nvmlHandle uintptr
 	engine     *cuda.Engine
 	jobCh      chan *stratum.Job
 	hashCount  atomic.Uint64
+	throttled  atomic.Bool
 }
 
 func main() {
@@ -54,16 +76,23 @@ func main() {
 	datFlag := flag.String("d", "", "Path to verthash.dat (auto-detected if omitted)")
 	genDat := flag.Bool("gen", false, "Generate verthash.dat if missing")
 	benchMode := flag.Bool("bench", false, "Run 5-second consensus self-test & multi-GPU benchmark")
+	tempLimit := flag.Uint("temp-limit", 82, "GPU temperature limit in C (0 to disable)")
+	devicesFlag := flag.String("devices", "", "Comma-separated GPU indices to use (e.g. 0,1)")
 	flag.Parse()
 
 	fmt.Println("=== verthash-go-miner (Zero-CGO Edition) ===")
 
-	driverVer, devices, err := cuda.InitDriver()
+	driverVer, allDevices, err := cuda.InitDriver()
 	if err != nil {
 		log.Fatalf("CUDA Init Error: %v", err)
 	}
-	nvmlHandles := cuda.InitNVML(devices)
-	fmt.Printf("CUDA Driver Version: %d.%d | Found %d GPU(s)\n", driverVer/1000, (driverVer%100)/10, len(devices))
+	nvmlHandles := cuda.InitNVML(allDevices)
+	devices := filterDevices(allDevices, *devicesFlag)
+	if len(devices) == 0 {
+		log.Fatalf("No matching CUDA devices found for -devices=%s", *devicesFlag)
+	}
+	fmt.Printf("CUDA Driver Version: %d.%d | Active GPU(s): %d | Temp Limit: %dC\n",
+		driverVer/1000, (driverVer%100)/10, len(devices), *tempLimit)
 
 	datPath := resolveVerthashDat(*datFlag)
 	if *genDat {
@@ -140,7 +169,7 @@ func main() {
 		wg.Wait()
 		if *poolURL == "" {
 			fmt.Println("\nTip: To mine live to p2pool-go-VTC, run:")
-			fmt.Println("  ./verthash-miner -o stratum+tcp://<NODE_IP>:9172 -u <YOUR_VTC_ADDRESS>+0.5")
+			fmt.Println("  ./verthash-miner -o stratum+tcp://127.0.0.1:9172 -u <YOUR_VTC_ADDRESS>+0.5")
 		}
 		return
 	}
@@ -200,8 +229,30 @@ func main() {
 			var en2Hex string
 			var hdr80 [80]byte
 			var nonce uint32
+			var batchCounter uint32
 
 			for {
+				// Periodic thermal protection check every 16 batches (~1 second)
+				if *tempLimit > 0 && batchCounter&0xF == 0 {
+					t := cuda.QueryTelemetry(wh.nvmlHandle)
+					if t.HasTemp && t.TempC >= uint32(*tempLimit) {
+						wh.throttled.Store(true)
+						resumeTemp := uint32(*tempLimit) - 4
+						fmt.Printf("[GPU %d] Thermal limit reached (%dC >= %dC) — pausing until %dC...\n",
+							wh.info.Index, t.TempC, *tempLimit, resumeTemp)
+						for {
+							time.Sleep(2 * time.Second)
+							t = cuda.QueryTelemetry(wh.nvmlHandle)
+							if !t.HasTemp || t.TempC <= resumeTemp {
+								fmt.Printf("[GPU %d] Cooled to %dC — resuming mining\n", wh.info.Index, t.TempC)
+								wh.throttled.Store(false)
+								break
+							}
+						}
+					}
+				}
+				batchCounter++
+
 				select {
 				case newJob := <-wh.jobCh:
 					curJob = newJob
@@ -280,7 +331,11 @@ func main() {
 				if tel.HasPower {
 					totalWatts += tel.PowerW
 				}
-				parts = append(parts, fmt.Sprintf("GPU%d: %.1f kH/s%s", w.info.Index, khs, tel.FormatCompact()))
+				status := ""
+				if w.throttled.Load() {
+					status = " [THROTTLED]"
+				}
+				parts = append(parts, fmt.Sprintf("GPU%d: %.1f kH/s%s%s", w.info.Index, khs, tel.FormatCompact(), status))
 			}
 			acc := client.AcceptedShares.Load()
 			rej := client.RejectedShares.Load()
