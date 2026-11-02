@@ -9,3 +9,9 @@ dist/
 build/
 .vscode/
 .idea/
+
+# Local launch scripts and Linux binaries
+mine.sh
+*.sh
+verthash-miner
+verthash-miner-*
