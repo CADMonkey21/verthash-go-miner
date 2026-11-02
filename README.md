@@ -9,13 +9,13 @@ A 100% pure Go (`CGO_ENABLED=0`), zero-CGO NVIDIA CUDA GPU miner for Vertcoin (V
 - **Startup Consensus Self-Test:** Verifies 100% bit-exact GPU consensus against the CPU Verthash reference implementation before submitting shares.
 - **Zero-CGO NVML Telemetry & Thermal Protection:** Reports live per-GPU core temperature, fan speed percentage, power draw (Watts), and rig `kH/W` efficiency, with automatic thermal throttling (`-temp-limit`).
 
-## Benchmarks
-| GPU | Memory Bus | Hashrate | Power | Efficiency |
-| :--- | :--- | :--- | :--- | :--- |
-| NVIDIA GeForce RTX 3070 (8 GB) | 256-bit GDDR6 | ~1,035 - 1,061 kH/s | ~158 W | ~6.55 kH/W |
-| NVIDIA GeForce RTX 3060 (12 GB) | 192-bit GDDR6 | ~708 - 711 kH/s | ~120 W | ~5.90 kH/W |
-| NVIDIA GeForce RTX 4060 Ti (8 GB) | 128-bit GDDR6 | ~523 - 525 kH/s | ~79 W | ~6.63 kH/W |
-| NVIDIA GeForce GTX 1650 (4 GB) | 128-bit GDDR5 | ~183 - 196 kH/s | ~43 W | ~4.42 kH/W |
+## Benchmarks (Multi-Minute Sustained Live Mining)
+| GPU | Memory Bus | Sustained Hashrate | Peak Hashrate | Power | Efficiency |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| NVIDIA GeForce RTX 3070 (8 GB) | 256-bit GDDR6 | ~1,009 - 1,035 kH/s | 1,061.7 kH/s | ~161 W | ~6.35 kH/W |
+| NVIDIA GeForce RTX 3060 (12 GB) | 192-bit GDDR6 | ~708 - 721 kH/s | 734.0 kH/s | ~124 W | ~5.82 kH/W |
+| NVIDIA GeForce RTX 4060 Ti (8 GB) | 128-bit GDDR6 | ~524 - 537 kH/s | 550.4 kH/s | ~84 W | ~6.36 kH/W |
+| NVIDIA GeForce GTX 1650 (4 GB) | 128-bit GDDR5 | ~183 - 190 kH/s | 196.6 kH/s | ~44 W | ~4.25 kH/W |
 
 ## Build Instructions (Windows & Linux)
 
