@@ -2,6 +2,7 @@ package stratum
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -16,6 +17,12 @@ import (
 	"time"
 )
 
+type TargetState struct {
+	Difficulty float64
+	Target256  *big.Int
+	TargetU64  uint64
+}
+
 type Job struct {
 	JobID          string
 	PrevHashLE     [32]byte
@@ -27,11 +34,33 @@ type Job struct {
 	NTimeHex       string
 	NTime          uint32
 	CleanJobs      bool
+	SameTemplate   bool
 	ExtraNonce1    []byte
 	ExtraNonce2Len int
 	Difficulty     float64
 	Target256      *big.Int
 	TargetU64      uint64
+}
+
+func SameWork(a, b *Job) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if a.PrevHashLE != b.PrevHashLE || a.Version != b.Version || a.Bits != b.Bits || a.NTime != b.NTime {
+		return false
+	}
+	if !bytes.Equal(a.Coinb1, b.Coinb1) || !bytes.Equal(a.Coinb2, b.Coinb2) || !bytes.Equal(a.ExtraNonce1, b.ExtraNonce1) {
+		return false
+	}
+	if len(a.MerkleBranches) != len(b.MerkleBranches) {
+		return false
+	}
+	for i := range a.MerkleBranches {
+		if !bytes.Equal(a.MerkleBranches[i], b.MerkleBranches[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 type rpcMessage struct {
@@ -49,19 +78,20 @@ type rpcRequest struct {
 }
 
 type Client struct {
-	Addr     string
-	User     string
-	Pass     string
-	conn     net.Conn
-	mu       sync.Mutex
-	reqID    atomic.Uint64
-	en2Seq   atomic.Uint64
+	Addr   string
+	User   string
+	Pass   string
+	conn   net.Conn
+	mu     sync.Mutex
+	reqID  atomic.Uint64
+	en2Seq atomic.Uint64
 
 	extraNonce1    []byte
 	extraNonce2Len int
 	difficulty     float64
 	target256      *big.Int
 	targetU64      uint64
+	targetState    atomic.Pointer[TargetState]
 	lastJob        *Job
 
 	OnNewJob       func(job *Job)
@@ -80,6 +110,10 @@ func NewClient(addr, user, pass string, onNewJob func(job *Job)) *Client {
 	}
 	c.setDifficulty(0.01)
 	return c
+}
+
+func (c *Client) CurrentTarget() *TargetState {
+	return c.targetState.Load()
 }
 
 func doubleSHA256(b []byte) [32]byte {
@@ -137,6 +171,11 @@ func (c *Client) setDifficulty(diff float64) {
 	c.difficulty = diff
 	c.target256 = t256
 	c.targetU64 = t64
+	c.targetState.Store(&TargetState{
+		Difficulty: diff,
+		Target256:  t256,
+		TargetU64:  t64,
+	})
 }
 
 func (c *Client) ConnectAndRun() error {
@@ -150,6 +189,7 @@ func (c *Client) ConnectAndRun() error {
 	}
 	c.mu.Lock()
 	c.conn = conn
+	c.lastJob = nil
 	c.mu.Unlock()
 	defer conn.Close()
 
@@ -207,6 +247,7 @@ func (c *Client) handleMessage(msg *rpcMessage) {
 			var p []float64
 			if err := json.Unmarshal(*msg.Params, &p); err == nil && len(p) > 0 {
 				c.mu.Lock()
+				oldDiff := c.difficulty
 				c.setDifficulty(p[0])
 				if c.lastJob != nil {
 					updated := *c.lastJob
@@ -216,7 +257,9 @@ func (c *Client) handleMessage(msg *rpcMessage) {
 					c.lastJob = &updated
 				}
 				c.mu.Unlock()
-				fmt.Printf("[Stratum] Vardiff updated -> %.5f\n", p[0])
+				if oldDiff != p[0] {
+					fmt.Printf("[Stratum] Vardiff updated -> %.5f\n", p[0])
+				}
 			}
 		case "mining.notify":
 			if msg.Params == nil {
@@ -281,6 +324,7 @@ func (c *Client) handleMessage(msg *rpcMessage) {
 				Target256:      c.target256,
 				TargetU64:      c.targetU64,
 			}
+			job.SameTemplate = SameWork(c.lastJob, job) && !clean
 			c.lastJob = job
 			c.mu.Unlock()
 

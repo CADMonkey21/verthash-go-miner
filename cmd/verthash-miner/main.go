@@ -69,6 +69,16 @@ type gpuWorkerHandle struct {
 	throttled  atomic.Bool
 }
 
+type shareCandidate struct {
+	gpuIndex int32
+	jobID    string
+	en2Hex   string
+	nTimeHex string
+	hdr80    [80]byte
+	nonce    uint32
+	target   *stratum.TargetState
+}
+
 func main() {
 	poolURL := flag.String("o", "", "Stratum server URL (e.g. stratum+tcp://127.0.0.1:9172)")
 	user := flag.String("u", "", "Vertcoin payout address (supports +diff hint)")
@@ -192,7 +202,8 @@ func main() {
 
 	client = stratum.NewClient(*poolURL, *user, *pass, func(job *stratum.Job) {
 		for _, w := range workers {
-			if w.engine != nil {
+			// Only preempt in-flight GPU kernel if block/share template actually changed
+			if !job.SameTemplate && w.engine != nil {
 				w.engine.Abort()
 			}
 			select {
@@ -202,6 +213,50 @@ func main() {
 			w.jobCh <- job
 		}
 	})
+
+	// Asynchronous CPU share verifier & submitter (keeps GPU kernel loop 100% stall-free)
+	shareCh := make(chan shareCandidate, 256)
+	go func() {
+		for cand := range shareCh {
+			candHdr := cand.hdr80
+			cuda.PutNonce(&candHdr, cand.nonce)
+			fullHashLE, err := vh.SumVerthash(candHdr[:])
+			if err != nil {
+				continue
+			}
+			powInt, shareDiff := stratum.TargetToDiff(fullHashLE)
+			if powInt.Cmp(cand.target.Target256) <= 0 {
+				fmt.Printf("[GPU %d] Found Share! Nonce: %08x | Share Diff: %.5f (Target: %.5f)\n",
+					cand.gpuIndex, cand.nonce, shareDiff, cand.target.Difficulty)
+				_ = client.SubmitShare(cand.jobID, cand.en2Hex, cand.nTimeHex, cand.nonce)
+			}
+		}
+	}()
+
+	// Background thermal watchdog (polls NVML out-of-band so CUDA launches never wait on I2C)
+	if *tempLimit > 0 {
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			resumeTemp := uint32(*tempLimit) - 4
+			for range ticker.C {
+				for _, w := range workers {
+					t := cuda.QueryTelemetry(w.nvmlHandle)
+					if !t.HasTemp {
+						continue
+					}
+					if !w.throttled.Load() && t.TempC >= uint32(*tempLimit) {
+						w.throttled.Store(true)
+						fmt.Printf("[GPU %d] Thermal limit reached (%dC >= %dC) — pausing until %dC...\n",
+							w.info.Index, t.TempC, *tempLimit, resumeTemp)
+					} else if w.throttled.Load() && t.TempC <= resumeTemp {
+						w.throttled.Store(false)
+						fmt.Printf("[GPU %d] Cooled to %dC — resuming mining\n", w.info.Index, t.TempC)
+					}
+				}
+			}
+		}()
+	}
 
 	for i, w := range workers {
 		go func(idx int, wh *gpuWorkerHandle) {
@@ -229,38 +284,26 @@ func main() {
 			var en2Hex string
 			var hdr80 [80]byte
 			var nonce uint32
-			var batchCounter uint32
 
 			for {
-				// Periodic thermal protection check every 16 batches (~1 second)
-				if *tempLimit > 0 && batchCounter&0xF == 0 {
-					t := cuda.QueryTelemetry(wh.nvmlHandle)
-					if t.HasTemp && t.TempC >= uint32(*tempLimit) {
-						wh.throttled.Store(true)
-						resumeTemp := uint32(*tempLimit) - 4
-						fmt.Printf("[GPU %d] Thermal limit reached (%dC >= %dC) — pausing until %dC...\n",
-							wh.info.Index, t.TempC, *tempLimit, resumeTemp)
-						for {
-							time.Sleep(2 * time.Second)
-							t = cuda.QueryTelemetry(wh.nvmlHandle)
-							if !t.HasTemp || t.TempC <= resumeTemp {
-								fmt.Printf("[GPU %d] Cooled to %dC — resuming mining\n", wh.info.Index, t.TempC)
-								wh.throttled.Store(false)
-								break
-							}
-						}
-					}
+				if wh.throttled.Load() {
+					time.Sleep(500 * time.Millisecond)
+					continue
 				}
-				batchCounter++
 
 				select {
 				case newJob := <-wh.jobCh:
-					curJob = newJob
-					en2Bytes, hexStr := client.NextExtraNonce2(curJob.ExtraNonce2Len)
-					en2Hex = hexStr
-					hdr80 = curJob.BuildHeader(en2Bytes)
-					_ = eng.SetHeader(hdr80)
-					nonce = uint32(idx) * 0x40000000
+					if curJob != nil && newJob.SameTemplate {
+						// Vardiff-only notify: keep current header & nonce stream uninterrupted
+						curJob.JobID = newJob.JobID
+					} else {
+						curJob = newJob
+						en2Bytes, hexStr := client.NextExtraNonce2(curJob.ExtraNonce2Len)
+						en2Hex = hexStr
+						hdr80 = curJob.BuildHeader(en2Bytes)
+						_ = eng.SetHeader(hdr80)
+						nonce = uint32(idx) * 0x40000000
+					}
 				default:
 					if curJob == nil {
 						newJob := <-wh.jobCh
@@ -273,7 +316,8 @@ func main() {
 					}
 				}
 
-				candidates, err := eng.SearchBatch(nonce, gridBlocks, threads, curJob.TargetU64)
+				target := client.CurrentTarget()
+				candidates, err := eng.SearchBatch(nonce, gridBlocks, threads, target.TargetU64)
 				if err != nil {
 					log.Printf("[GPU %d] Kernel error: %v", wh.info.Index, err)
 					time.Sleep(time.Second)
@@ -282,17 +326,17 @@ func main() {
 				wh.hashCount.Add(uint64(batchSize))
 
 				for _, candNonce := range candidates {
-					candHdr := hdr80
-					cuda.PutNonce(&candHdr, candNonce)
-					fullHashLE, err := vh.SumVerthash(candHdr[:])
-					if err != nil {
-						continue
-					}
-					powInt, shareDiff := stratum.TargetToDiff(fullHashLE)
-					if powInt.Cmp(curJob.Target256) <= 0 {
-						fmt.Printf("[GPU %d] Found Share! Nonce: %08x | Share Diff: %.5f (Target: %.5f)\n",
-							wh.info.Index, candNonce, shareDiff, curJob.Difficulty)
-						_ = client.SubmitShare(curJob.JobID, en2Hex, curJob.NTimeHex, candNonce)
+					select {
+					case shareCh <- shareCandidate{
+						gpuIndex: wh.info.Index,
+						jobID:    curJob.JobID,
+						en2Hex:   en2Hex,
+						nTimeHex: curJob.NTimeHex,
+						hdr80:    hdr80,
+						nonce:    candNonce,
+						target:   target,
+					}:
+					default:
 					}
 				}
 
