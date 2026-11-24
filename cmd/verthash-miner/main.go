@@ -88,6 +88,8 @@ func main() {
 	benchMode := flag.Bool("bench", false, "Run 5-second consensus self-test & multi-GPU benchmark")
 	tempLimit := flag.Uint("temp-limit", 82, "GPU temperature limit in C (0 to disable)")
 	devicesFlag := flag.String("devices", "", "Comma-separated GPU indices to use (e.g. 0,1)")
+	gridFlag := flag.Uint("grid", 256, "CUDA grid blocks per launch (default 256 for smooth WDDM desktop preemption)")
+	minKHs := flag.Float64("min-khs", 0, "Exit for restart if total hashrate stays below this kH/s for 60s (0 to disable)")
 	flag.Parse()
 
 	fmt.Println("=== verthash-go-miner (Zero-CGO Edition) ===")
@@ -150,9 +152,9 @@ func main() {
 				fmt.Printf("[GPU %d] %s -> Consensus Self-Test PASSED (100%% bit-exact match)\n", d.Index, d.Name)
 
 				_ = eng.SetHeader(testHeader)
-				gridBlocks := uint32(512)
-				if d.TotalMB > 6000 {
-					gridBlocks = 1024
+				gridBlocks := uint32(*gridFlag)
+				if gridBlocks == 0 {
+					gridBlocks = 256
 				}
 				const threads = uint32(256)
 				batchSize := gridBlocks * threads
@@ -273,9 +275,9 @@ func main() {
 			fmt.Printf("[GPU %d] %s (%d MB)%s -> Ready & Verified\n",
 				wh.info.Index, wh.info.Name, wh.info.TotalMB, tel.FormatCompact())
 
-			gridBlocks := uint32(256)
-			if wh.info.TotalMB > 6000 {
-				gridBlocks = 512
+			gridBlocks := uint32(*gridFlag)
+			if gridBlocks == 0 {
+				gridBlocks = 256
 			}
 			const threads = uint32(256)
 			batchSize := gridBlocks * threads
@@ -301,7 +303,10 @@ func main() {
 						en2Bytes, hexStr := client.NextExtraNonce2(curJob.ExtraNonce2Len)
 						en2Hex = hexStr
 						hdr80 = curJob.BuildHeader(en2Bytes)
-						_ = eng.SetHeader(hdr80)
+						if err := eng.SetHeader(hdr80); err != nil {
+							log.Printf("[GPU %d] Fatal CUDA SetHeader error (%v) — exiting for clean driver recovery", wh.info.Index, err)
+							os.Exit(1)
+						}
 						nonce = uint32(idx) * 0x40000000
 					}
 				default:
@@ -311,7 +316,10 @@ func main() {
 						en2Bytes, hexStr := client.NextExtraNonce2(curJob.ExtraNonce2Len)
 						en2Hex = hexStr
 						hdr80 = curJob.BuildHeader(en2Bytes)
-						_ = eng.SetHeader(hdr80)
+						if err := eng.SetHeader(hdr80); err != nil {
+							log.Printf("[GPU %d] Fatal CUDA SetHeader error (%v) — exiting for clean driver recovery", wh.info.Index, err)
+							os.Exit(1)
+						}
 						nonce = uint32(idx) * 0x40000000
 					}
 				}
@@ -319,9 +327,8 @@ func main() {
 				target := client.CurrentTarget()
 				candidates, err := eng.SearchBatch(nonce, gridBlocks, threads, target.TargetU64)
 				if err != nil {
-					log.Printf("[GPU %d] Kernel error: %v", wh.info.Index, err)
-					time.Sleep(time.Second)
-					continue
+					log.Printf("[GPU %d] Fatal CUDA kernel/sync error (%v) — exiting for clean driver recovery", wh.info.Index, err)
+					os.Exit(1)
 				}
 				wh.hashCount.Add(uint64(batchSize))
 
@@ -345,7 +352,10 @@ func main() {
 					en2Bytes, hexStr := client.NextExtraNonce2(curJob.ExtraNonce2Len)
 					en2Hex = hexStr
 					hdr80 = curJob.BuildHeader(en2Bytes)
-					_ = eng.SetHeader(hdr80)
+					if err := eng.SetHeader(hdr80); err != nil {
+						log.Printf("[GPU %d] Fatal CUDA SetHeader error (%v) — exiting for clean driver recovery", wh.info.Index, err)
+						os.Exit(1)
+					}
 				}
 			}
 		}(i, w)
@@ -356,6 +366,7 @@ func main() {
 		defer ticker.Stop()
 		lastCounts := make([]uint64, len(workers))
 		lastTime := time.Now()
+		lowHashStrikes := 0
 
 		for range ticker.C {
 			now := time.Now()
@@ -390,6 +401,24 @@ func main() {
 			}
 			fmt.Printf("[Stats] Total: %.2f kH/s [%s]%s | Shares: %d Acc / %d Rej\n",
 				totalKHs, strings.Join(parts, " | "), powerSummary, acc, rej)
+			if *minKHs > 0 {
+				anyThrottled := false
+				for _, w := range workers {
+					if w.throttled.Load() {
+						anyThrottled = true
+						break
+					}
+				}
+				if !anyThrottled && totalKHs < *minKHs {
+					lowHashStrikes++
+					if lowHashStrikes >= 6 {
+						log.Printf("[Watchdog] Hashrate %.1f kH/s below %.1f kH/s for 60s — exiting for clean driver recovery", totalKHs, *minKHs)
+						os.Exit(1)
+					}
+				} else {
+					lowHashStrikes = 0
+				}
+			}
 		}
 	}()
 

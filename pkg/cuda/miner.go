@@ -118,7 +118,9 @@ func NewEngine(deviceID int32, verthashDat []byte) (*Engine, error) {
 
 func (e *Engine) SetHeader(header80 [80]byte) error {
 	copy(e.hostHeader, header80[:])
-	CuMemcpyHtoD(e.dHdr, e.pHeader, 80)
+	if res := CuMemcpyHtoD(e.dHdr, e.pHeader, 80); res != CUDA_SUCCESS {
+		return fmt.Errorf("cuMemcpyHtoD(header) failed: %d", res)
+	}
 	*e.hostAbort = 0
 
 	args := [...]unsafe.Pointer{
@@ -127,6 +129,9 @@ func (e *Engine) SetHeader(header80 [80]byte) error {
 	}
 	if res := CuLaunchKernel(e.fnMidstate, 1, 1, 1, 8, 1, 1, 0, 0, &args[0], nil); res != CUDA_SUCCESS {
 		return fmt.Errorf("cuLaunchKernel(verthash_precompute_midstates) failed: %d", res)
+	}
+	if res := CuStreamSynchronize(0); res != CUDA_SUCCESS {
+		return fmt.Errorf("cuStreamSynchronize(verthash_precompute_midstates) failed: %d", res)
 	}
 	return nil
 }
@@ -147,7 +152,9 @@ func (e *Engine) HashOne(header80 [80]byte) ([32]byte, error) {
 	if res := CuLaunchKernel(e.fnHashOne, 1, 1, 1, 1, 1, 1, 0, 0, &args[0], nil); res != CUDA_SUCCESS {
 		return [32]byte{}, fmt.Errorf("cuLaunchKernel(verthash_hash_one) failed: %d", res)
 	}
-	CuStreamSynchronize(0)
+	if res := CuStreamSynchronize(0); res != CUDA_SUCCESS {
+		return [32]byte{}, fmt.Errorf("cuStreamSynchronize(verthash_hash_one) failed: %d", res)
+	}
 
 	var out [32]byte
 	copy(out[:], e.hostOutHash)
@@ -171,7 +178,9 @@ func (e *Engine) SearchBatch(startNonce uint32, gridBlocks, threadsPerBlock uint
 	if res := CuLaunchKernel(e.fnSearch, gridBlocks, 1, 1, threadsPerBlock, 1, 1, 0, 0, &args[0], nil); res != CUDA_SUCCESS {
 		return nil, fmt.Errorf("cuLaunchKernel(verthash_search) failed: %d", res)
 	}
-	CuStreamSynchronize(0)
+	if res := CuStreamSynchronize(0); res != CUDA_SUCCESS {
+		return nil, fmt.Errorf("cuStreamSynchronize(verthash_search) failed: %d", res)
+	}
 
 	count := e.hostResults[0]
 	if count == 0 {
